@@ -1,0 +1,703 @@
+```{r setup, message=FALSE, warning=FALSE}
+# ACTL4002 — Final Benchmark + 3-state HMM ESG pipeline
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(mvtnorm)
+library(knitr)
+library(scales)
+library(MSTest)
+
+# Paths -----------------------------------------------------------------------
+
+data_dir <- "/Users/katz/Desktop/UNi Year 4/Semester 2/ALM/"
+output_dir <- file.path(data_dir, "ACTL4002_ESG_outputs")
+report_dir <- file.path(output_dir, "report")
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(report_dir, showWarnings = FALSE, recursive = TRUE)
+
+unlink(list.files(output_dir, pattern = "\\.csv$", full.names = TRUE), force = TRUE)
+unlink(list.files(report_dir, pattern = "^Diagnostic_.*\\.png$", full.names = TRUE), force = TRUE)
+
+source_files <- c(
+  Equities = file.path(data_dir, "AXJO Data.xlsx"),
+  Property = file.path(data_dir, "AXPJA Data.xlsx"),
+  Bonds = file.path(data_dir, "BACM0 Data.xlsx")
+)
+rba_files <- c(
+  Historical = file.path(data_dir, "RBA_F17_Zero_Coupon_Interest_Rates_1992_2016.xls"),
+  Current = file.path(data_dir, "RBA_F17_Zero_Coupon_Interest_Rates_2017_Current.xlsx")
+)
+all_inputs <- c(source_files, rba_files)
+if (any(!file.exists(all_inputs))) stop("Missing input file(s):\n", paste(all_inputs[!file.exists(all_inputs)], collapse = "\n"))
+
+# Locked assumptions -----------------------------------------------------------
+
+analysis_end_month <- as.Date("2026-08-01")
+history_years <- 20L
+projection_months <- 12L
+n_simulations <- 1000000L
+validation_months <- 100000L
+validation_burnin <- 500L
+initial_value <- 100
+strategic_weights <- c(Equities = 0.50, Property = 0.10, Bonds = 0.40)
+asset_names <- names(strategic_weights)
+selected_hmm_states <- 3L
+candidate_hmm_states <- 2:4
+hmm_random_starts <- 20L
+hmm_max_iter <- 1000L
+hmm_parameter_tolerance <- 1e-7
+minimum_state_occupancy <- 0.03
+hmm_fit_scale <- 100
+master_seed <- 20260821L
+benchmark_seed <- master_seed + 101L
+hmm_seed <- master_seed + 202L
+validation_seed <- master_seed + 303L
+var_confidence <- 0.995
+tvar_confidence <- 0.99
+cost_of_capital_spread_cc <- 0.06
+
+write_out <- function(x, filename, row.names = FALSE) {
+  write.csv(x, file.path(output_dir, filename), row.names = row.names)
+}
+
+save_plot <- function(p, filename, width = 6.27, height = 3.60) {
+  ggsave(file.path(report_dir, filename), p, width = width, height = height,
+         units = "in", dpi = 320, bg = "white")
+}
+
+coerce_excel_date <- function(x) {
+  if (inherits(x, "Date")) return(x)
+  if (inherits(x, "POSIXt")) return(as.Date(x))
+  if (is.numeric(x)) return(as.Date(x, origin = "1899-12-30"))
+  z <- trimws(as.character(x))
+  z[z %in% c("", "NA", "N/A", "NULL")] <- NA_character_
+  d <- suppressWarnings(as.Date(parse_date_time(
+    z, orders = c("Ymd HMS", "Ymd", "dmy HMS", "dmy", "mdy HMS", "mdy",
+                  "d b Y", "d-B-Y", "Y/m/d", "d/m/Y", "m/d/Y"), quiet = TRUE
+  )))
+  miss <- is.na(d) & !is.na(z)
+  if (any(miss)) {
+    num <- suppressWarnings(as.numeric(z[miss]))
+    idx <- which(miss)[!is.na(num)]
+    d[idx] <- as.Date(num[!is.na(num)], origin = "1899-12-30")
+  }
+  d
+}
+```
+
+```{r asset-data}
+# Asset data ---------------------------------------------------------
+
+read_asset <- function(path, asset) {
+  x <- read_excel(path, sheet = "Table Data", skip = 2,
+                  col_names = c("date", "level"), .name_repair = "minimal") %>%
+    transmute(date = coerce_excel_date(date), level = as.numeric(level)) %>%
+    filter(!is.na(date), !is.na(level)) %>% arrange(date) %>% distinct(date, .keep_all = TRUE)
+  names(x)[2] <- asset
+  x
+}
+
+month_end <- function(x, asset) {
+  x %>%
+    mutate(month = floor_date(date, "month"), calendar_month_end = ceiling_date(month, "month") - days(1)) %>%
+    group_by(month, calendar_month_end) %>%
+    slice_max(date, n = 1, with_ties = FALSE) %>% ungroup() %>%
+    transmute(month, calendar_month_end,
+              observation_date = date,
+              days_before_month_end = as.integer(calendar_month_end - date),
+              index_level = .data[[asset]]) %>%
+    rename(!!paste0(asset, "_date") := observation_date,
+           !!paste0(asset, "_days_before_month_end") := days_before_month_end,
+           !!asset := index_level)
+}
+
+daily_assets <- lapply(asset_names, function(a) read_asset(source_files[[a]], a))
+names(daily_assets) <- asset_names
+monthly_assets <- Map(month_end, daily_assets, asset_names)
+
+monthly_assets_all <- Reduce(
+  function(x, y) inner_join(x, y, by = c("month", "calendar_month_end")),
+  monthly_assets
+) %>% arrange(month)
+
+analysis_start_month <- analysis_end_month %m-% years(history_years)
+monthly_prices <- monthly_assets_all %>%
+  filter(month >= analysis_start_month, month <= analysis_end_month) %>% arrange(month)
+
+expected_levels <- history_years * 12 + 1L
+if (nrow(monthly_prices) != expected_levels || any(monthly_prices[asset_names] <= 0))
+  stop("Calibration data must contain 241 complete, positive month-end index levels.")
+```
+
+```{r rba-forward-curve}
+# RBA F17 curve ----------------------------------------------------------------
+
+find_sheet <- function(path, keyword) {
+  s <- excel_sheets(path)
+  hit <- grep(keyword, s, ignore.case = TRUE, value = TRUE)
+  if (!length(hit)) stop("Sheet not found: ", keyword, " in ", basename(path))
+  hit[1]
+}
+
+find_series_row <- function(raw) {
+  hit <- which(vapply(seq_len(nrow(raw)), function(i) {
+    any(trimws(as.character(unlist(raw[i, ], use.names = FALSE))) %in% c("Series ID", "Mnemonic"), na.rm = TRUE)
+  }, logical(1)))
+  if (!length(hit)) stop("RBA Series ID/Mnemonic row not found.")
+  hit[1]
+}
+
+read_f17 <- function(path, sheet_keyword, series_map) {
+  raw <- read_excel(path, sheet = find_sheet(path, sheet_keyword), col_names = FALSE, .name_repair = "minimal")
+  r <- find_series_row(raw)
+  ids <- trimws(as.character(unlist(raw[r, ], use.names = FALSE)))
+  cols <- match(unname(series_map), ids)
+  if (anyNA(cols)) stop("Missing RBA series: ", paste(unname(series_map)[is.na(cols)], collapse = ", "))
+  out <- tibble(date = coerce_excel_date(raw[[1]][(r + 1):nrow(raw)]))
+  for (j in seq_along(series_map)) out[[names(series_map)[j]]] <- as.numeric(raw[[cols[j]]][(r + 1):nrow(raw)])
+  out %>% filter(!is.na(date)) %>% arrange(date) %>% distinct(date, .keep_all = TRUE)
+}
+
+combine_periods <- function(old, new) {
+  bind_rows(mutate(old, priority = 1L), mutate(new, priority = 2L)) %>%
+    arrange(date, desc(priority)) %>% distinct(date, .keep_all = TRUE) %>% select(-priority)
+}
+
+yield_map <- c(yield_1y_pct = "FZCY100D")
+fwd_old <- c(forward_0y_pct = "FZCY0D", forward_025y_pct = "FZCF25D",
+             forward_050y_pct = "FZCF50D", forward_075y_pct = "FZCF75D", forward_100y_pct = "FZCF100D")
+fwd_new <- c(forward_0y_pct = "FZCF0D", forward_025y_pct = "FZCF25D",
+             forward_050y_pct = "FZCF50D", forward_075y_pct = "FZCF75D", forward_100y_pct = "FZCF100D")
+
+rba_yield <- combine_periods(
+  read_f17(rba_files[["Historical"]], "Yields", yield_map),
+  read_f17(rba_files[["Current"]], "Yields", yield_map)
+)
+rba_forward <- combine_periods(
+  read_f17(rba_files[["Historical"]], "Forward", fwd_old),
+  read_f17(rba_files[["Current"]], "Forward", fwd_new)
+)
+rba_daily <- inner_join(rba_yield, rba_forward, by = "date") %>%
+  mutate(risk_free_cc_rate_1y = yield_1y_pct / 100,
+         across(starts_with("forward_"), ~ .x / 100, .names = "{.col}_cc"))
+
+forward_node_times <- c(0, .25, .50, .75, 1)
+forward_node_columns_cc <- paste0(c("forward_0y_pct", "forward_025y_pct", "forward_050y_pct",
+                                    "forward_075y_pct", "forward_100y_pct"), "_cc")
+
+integrate_forward <- function(node_rates, a, b) {
+  x <- sort(unique(c(a, forward_node_times[forward_node_times > a & forward_node_times < b], b)))
+  y <- approx(forward_node_times, node_rates, xout = x, rule = 2)$y
+  sum(diff(x) * (head(y, -1) + tail(y, -1)) / 2)
+}
+
+extract_forward_nodes <- function(row) as.numeric(row[1, forward_node_columns_cc, drop = TRUE])
+monthly_forward_path <- function(nodes, n = 12L) vapply(seq_len(n), function(m)
+  integrate_forward(nodes, (m - 1) / 12, m / 12), numeric(1))
+
+align_rba <- function(prices) {
+  bind_rows(lapply(seq_len(nrow(prices)), function(i) {
+    target <- prices$calendar_month_end[i]
+    same_month <- rba_daily %>% filter(date <= target, floor_date(date, "month") == prices$month[i])
+    pool <- if (nrow(same_month)) same_month else rba_daily %>% filter(date <= target)
+    chosen <- pool %>% slice_max(date, n = 1, with_ties = FALSE)
+    bind_cols(tibble(month = prices$month[i], calendar_month_end = target, rba_rate_date = chosen$date),
+              select(chosen, -date))
+  }))
+}
+
+monthly_prices <- monthly_prices %>%
+  left_join(align_rba(monthly_prices), by = c("month", "calendar_month_end"))
+if (any(!complete.cases(monthly_prices[c("risk_free_cc_rate_1y", forward_node_columns_cc)])))
+  stop("Incomplete RBA F17 curve in calibration window.")
+
+projection_rf_row <- slice_tail(monthly_prices, n = 1)
+risk_free_date <- projection_rf_row$rba_rate_date
+risk_free_cc_rate <- projection_rf_row$risk_free_cc_rate_1y
+projection_forward_log_returns_raw <- monthly_forward_path(extract_forward_nodes(projection_rf_row), projection_months)
+endpoint_adjustment <- (risk_free_cc_rate - sum(projection_forward_log_returns_raw)) / projection_months
+projection_forward_log_returns <- projection_forward_log_returns_raw + endpoint_adjustment
+projection_forward_rates_annual_cc <- 12 * projection_forward_log_returns
+projection_rf_monthly_cc <- mean(projection_forward_log_returns)
+required_return_cc <- risk_free_cc_rate + cost_of_capital_spread_cc
+
+projection_forward_curve <- tibble(
+  Month = seq_len(projection_months),
+  Forward_Log_Return_CC = projection_forward_log_returns,
+  Forward_Rate_Annual_CC = projection_forward_rates_annual_cc,
+  Forward_Rate_Annual_CC_Pct = 100 * projection_forward_rates_annual_cc
+)
+projection_rf_summary <- tibble(
+  Final_Calibration_Month = as.character(analysis_end_month),
+  RBA_Curve_Date = as.character(risk_free_date),
+  Risk_Free_CC_1Y = risk_free_cc_rate,
+  Discount_Factor_1Y = exp(-risk_free_cc_rate),
+  Required_Return_CC = required_return_cc
+)
+write_out(projection_forward_curve, "projection_monthly_forward_rates.csv")
+write_out(projection_rf_summary, "projection_risk_free_assumption.csv")
+
+p_rf <- ggplot(monthly_prices, aes(calendar_month_end, risk_free_cc_rate_1y)) +
+  geom_line(linewidth = .7) + scale_y_continuous(labels = percent) +
+  labs(title = "RBA 1-Year Zero-Coupon Yield", x = NULL, y = "Continuously compounded yield") + theme_minimal()
+p_forward <- ggplot(projection_forward_curve, aes(Month, Forward_Rate_Annual_CC)) +
+  geom_line(linewidth = .9, colour = "#F28C28") + geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:12) + scale_y_continuous(labels = percent) +
+  labs(title = "Projection Monthly Forward Risk-Free Rates", x = "Projection month",
+       y = "Annualised continuously compounded forward rate") + theme_minimal()
+save_plot(p_rf, "Diagnostic_01_RBA_1Y_Zero_Coupon_Yield.png", height = 3.45)
+save_plot(p_forward, "Diagnostic_02_Projection_Forward_Rates.png", height = 3.45)
+```
+
+```{r returns-and-benchmark}
+# Historical returns and benchmark ---------------------------------------------
+
+price_matrix <- as.matrix(monthly_prices[, asset_names])
+log_return_matrix <- diff(log(price_matrix)); colnames(log_return_matrix) <- asset_names
+return_dates <- monthly_prices$calendar_month_end[-1]
+
+historical_rf_monthly_cc_start <- vapply(seq_len(nrow(monthly_prices) - 1L), function(i)
+  integrate_forward(extract_forward_nodes(monthly_prices[i, , drop = FALSE]), 0, 1 / 12), numeric(1))
+risk_premium_matrix <- sweep(log_return_matrix, 1, historical_rf_monthly_cc_start, "-")
+colnames(risk_premium_matrix) <- asset_names
+
+skew <- function(x) mean(((x - mean(x)) / sd(x))^3)
+ex_kurt <- function(x) mean(((x - mean(x)) / sd(x))^4) - 3
+
+distribution_stats <- function(X, source) bind_rows(lapply(seq_len(ncol(X)), function(j) {
+  x <- X[, j]
+  tibble(Source = source, Asset = colnames(X)[j], Mean_monthly_cc = mean(x), SD_monthly = sd(x),
+         Mean_annualised_cc = 12 * mean(x), Vol_annualised = sqrt(12) * sd(x),
+         Skewness = skew(x), Excess_Kurtosis = ex_kurt(x),
+         Q01 = unname(quantile(x, .01, type = 8)), Q05 = unname(quantile(x, .05, type = 8)),
+         Median = median(x), Q95 = unname(quantile(x, .95, type = 8)),
+         Q99 = unname(quantile(x, .99, type = 8)))
+}))
+
+historical_portfolio_gross_monthly <- as.vector(exp(log_return_matrix) %*% strategic_weights)
+rolling_12m_gross <- vapply(12:length(historical_portfolio_gross_monthly), function(i)
+  prod(historical_portfolio_gross_monthly[(i - 11):i]), numeric(1))
+historical_rolling_annual_return <- rolling_12m_gross - 1
+
+benchmark_mu <- colMeans(risk_premium_matrix)
+benchmark_sigma <- cov(risk_premium_matrix)
+benchmark_parameter_table <- tibble(
+  Asset = asset_names,
+  Mean_monthly_risk_premium_cc = benchmark_mu,
+  Mean_annualised_risk_premium_cc = 12 * benchmark_mu,
+  Projection_RF_annual_cc = risk_free_cc_rate,
+  Implied_mean_annualised_total_return_cc = risk_free_cc_rate + 12 * benchmark_mu,
+  Vol_monthly = sqrt(diag(benchmark_sigma)),
+  Vol_annualised = sqrt(12) * sqrt(diag(benchmark_sigma))
+)
+write_out(benchmark_parameter_table, "benchmark_risk_premium_parameters.csv")
+write_out(cov2cor(benchmark_sigma), "benchmark_risk_premium_correlation_matrix.csv", row.names = TRUE)
+
+Y_hmm_scaled <- risk_premium_matrix * hmm_fit_scale
+benchmark_mu_scaled <- colMeans(Y_hmm_scaled)
+benchmark_sigma_scaled <- cov(Y_hmm_scaled)
+benchmark_loglik_scaled <- sum(dmvnorm(Y_hmm_scaled, benchmark_mu_scaled, benchmark_sigma_scaled, log = TRUE))
+d <- ncol(Y_hmm_scaled); npar_bench <- d + d * (d + 1) / 2
+benchmark_AIC <- -2 * benchmark_loglik_scaled + 2 * npar_bench
+benchmark_BIC <- -2 * benchmark_loglik_scaled + log(nrow(Y_hmm_scaled)) * npar_bench
+```
+
+```{r hmm-fit}
+# HMM fitting, labelling and parameters ----------------------------------------
+
+fit_hmm <- function(K, Y = Y_hmm_scaled, seed = master_seed + 1000L * K) {
+  set.seed(seed)
+  MSTest::HMmdl(Y = Y, k = K, control = list(
+    msmu = TRUE, msvar = TRUE, getSE = FALSE, method = "EM",
+    maxit = hmm_max_iter, thtol = hmm_parameter_tolerance,
+    conv = "loglik", use_diff_init = hmm_random_starts
+  ))
+}
+
+hmm_converged <- function(fit) is.finite(fit$deltath) &&
+  fit$deltath <= fit$control$thtol && fit$iterations < fit$control$maxit
+
+as_row_transition <- function(P, tol = 1e-6) {
+  if (max(abs(colSums(P) - 1)) <= tol) return(t(P))
+  if (max(abs(rowSums(P) - 1)) <= tol) return(P)
+  stop("HMM transition matrix is not stochastic.")
+}
+
+stationary_distribution <- function(P) {
+  e <- eigen(t(P)); v <- Re(e$vectors[, which.min(abs(e$values - 1))])
+  if (sum(v) < 0) v <- -v
+  v[v < 0] <- 0
+  v / sum(v)
+}
+
+zscore <- function(x) if (sd(x) == 0) rep(0, length(x)) else as.numeric(scale(x))
+
+extract_hmm <- function(fit) {
+  mu0 <- fit$mu / hmm_fit_scale
+  S0 <- lapply(fit$sigma, function(S) as.matrix(S) / hmm_fit_scale^2)
+  P0 <- as_row_transition(fit$P)
+  probs0 <- as.matrix(fit$St)
+  pmean <- as.vector(mu0 %*% strategic_weights)
+  pvol <- vapply(seq_len(nrow(mu0)), function(k)
+    sqrt(as.numeric(t(strategic_weights) %*% S0[[k]] %*% strategic_weights)), numeric(1))
+  stress <- which.max(zscore(pvol) - zscore(pmean))
+  remain <- setdiff(seq_len(nrow(mu0)), stress)
+  growth <- remain[which.max(pmean[remain])]
+  normal <- setdiff(seq_len(nrow(mu0)), c(stress, growth))
+  ord <- c(Normal = normal, Growth = growth, Stress = stress)
+  idx <- unname(ord); labels <- names(ord)
+  mu <- mu0[idx, , drop = FALSE]; S <- S0[idx]; P <- P0[idx, idx, drop = FALSE]; probs <- probs0[, idx, drop = FALSE]
+  rownames(mu) <- labels; colnames(mu) <- asset_names
+  rownames(P) <- labels; colnames(P) <- labels; colnames(probs) <- labels
+  for (k in seq_along(S)) rownames(S[[k]]) <- colnames(S[[k]]) <- asset_names
+  list(mu = mu, Sigma = S, P = P, probs = probs,
+       final = setNames(probs[nrow(probs), ], labels),
+       occupancy = setNames(colMeans(probs), labels),
+       stationary = setNames(stationary_distribution(P), labels),
+       duration = setNames(1 / (1 - diag(P)), labels), labels = labels)
+}
+
+hmm_candidates <- setNames(lapply(candidate_hmm_states, fit_hmm), candidate_hmm_states)
+model_selection_table <- bind_rows(
+  tibble(Model = "Benchmark Gaussian", States = 1L, Log_Likelihood = benchmark_loglik_scaled,
+         AIC = benchmark_AIC, BIC = benchmark_BIC, Converged = TRUE, Iterations = NA_integer_,
+         Minimum_Smoothed_Occupancy = 1),
+  bind_rows(lapply(hmm_candidates, function(fit) tibble(
+    Model = paste0("HMM ", fit$k, "-state"), States = fit$k, Log_Likelihood = fit$logLike,
+    AIC = fit$AIC, BIC = fit$BIC, Converged = hmm_converged(fit), Iterations = fit$iterations,
+    Minimum_Smoothed_Occupancy = min(colMeans(fit$St))
+  )))
+) %>% arrange(States)
+write_out(model_selection_table, "model_selection_diagnostics.csv")
+
+selected_fit_pkg <- hmm_candidates[[as.character(selected_hmm_states)]]
+hmm <- extract_hmm(selected_fit_pkg)
+mu_hmm <- hmm$mu; Sigma_hmm <- hmm$Sigma; P_row <- hmm$P
+smoothed_probabilities <- hmm$probs; state_labels <- hmm$labels
+final_filtered_probabilities <- hmm$final
+smoothed_occupancy <- hmm$occupancy
+stationary_probabilities <- hmm$stationary
+expected_duration_months <- hmm$duration
+
+regime_parameter_table <- bind_rows(lapply(seq_len(selected_hmm_states), function(k) tibble(
+  State = state_labels[k], Asset = asset_names,
+  Mean_monthly_risk_premium_cc = mu_hmm[k, ],
+  Mean_annualised_risk_premium_cc = 12 * mu_hmm[k, ],
+  Mean_monthly_cc = projection_rf_monthly_cc + mu_hmm[k, ],
+  Mean_annualised_cc = risk_free_cc_rate + 12 * mu_hmm[k, ],
+  Projection_RF_annual_cc = risk_free_cc_rate,
+  Vol_monthly = sqrt(diag(Sigma_hmm[[k]])),
+  Vol_annualised = sqrt(12) * sqrt(diag(Sigma_hmm[[k]])),
+  Smoothed_Occupancy = smoothed_occupancy[k],
+  Stationary_Probability = stationary_probabilities[k],
+  Expected_Duration_Months = expected_duration_months[k]
+)))
+transition_table <- as.data.frame(P_row) %>% mutate(From_State = rownames(P_row), .before = 1)
+regime_correlations <- bind_rows(lapply(seq_len(selected_hmm_states), function(k)
+  as.data.frame(as.table(cov2cor(Sigma_hmm[[k]]))) %>%
+    transmute(State = state_labels[k], Asset_1 = Var1, Asset_2 = Var2, Correlation = Freq)))
+write_out(regime_parameter_table, "hmm_regime_parameters.csv")
+write_out(transition_table, "hmm_transition_matrix_row_stochastic.csv")
+write_out(regime_correlations, "hmm_regime_correlations.csv")
+
+state_probability_table <- tibble(
+  date = return_dates,
+  Normal = smoothed_probabilities[, "Normal"], Growth = smoothed_probabilities[, "Growth"],
+  Stress = smoothed_probabilities[, "Stress"],
+  Most_Likely_State = state_labels[max.col(smoothed_probabilities, ties.method = "first")]
+)
+state_probability_long <- state_probability_table %>%
+  pivot_longer(all_of(state_labels), names_to = "State", values_to = "Probability")
+p_states <- ggplot(state_probability_long, aes(date, Probability, linetype = State)) +
+  geom_line(linewidth = .65) + scale_y_continuous(labels = percent) +
+  labs(title = "Smoothed 3-State HMM Probabilities", x = NULL, y = "Smoothed probability") + theme_minimal()
+save_plot(p_states, "Diagnostic_03_HMM_Smoothed_State_Probabilities.png")
+```
+
+```{r historical-regime-figure}
+# Historical asset performance with fitted regimes ----------------------------
+
+historical_state_overlay <- monthly_prices %>%
+  filter(calendar_month_end %in% return_dates) %>%
+  select(calendar_month_end, all_of(asset_names)) %>%
+  left_join(select(state_probability_table, date, Most_Likely_State),
+            by = c("calendar_month_end" = "date")) %>% arrange(calendar_month_end) %>%
+  mutate(across(all_of(asset_names), ~ 100 * .x / first(.x), .names = "{.col}_Index100"))
+
+historical_regime_bands <- historical_state_overlay %>%
+  transmute(State = Most_Likely_State, xmin = floor_date(calendar_month_end, "month"),
+            xmax = ceiling_date(calendar_month_end, "month"), ymin = -Inf, ymax = Inf)
+historical_asset_long <- historical_state_overlay %>%
+  select(calendar_month_end, ends_with("_Index100")) %>%
+  pivot_longer(-calendar_month_end, names_to = "Asset", values_to = "Index_Value") %>%
+  mutate(Asset = sub("_Index100$", "", Asset),
+         Asset = factor(Asset, levels = c("Equities", "Property", "Bonds")))
+
+state_colours <- c(Normal = "#D9D9D9", Growth = "#F28C28", Stress = "#555555")
+asset_colours <- c(Equities = "#111111", Property = "#F28C28", Bonds = "#777777")
+p_historical_states <- ggplot() +
+  geom_rect(data = historical_regime_bands,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = State),
+            alpha = .20, colour = NA, inherit.aes = FALSE) +
+  geom_line(data = historical_asset_long,
+            aes(calendar_month_end, Index_Value, colour = Asset), linewidth = .85) +
+  facet_wrap(~ Asset, ncol = 1, scales = "free_y") +
+  scale_fill_manual(values = state_colours) + scale_colour_manual(values = asset_colours, guide = "none") +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y", expand = expansion(mult = c(.01, .01))) +
+  labs(title = "Historical Asset Performance and Estimated HMM Regimes",
+       subtitle = "Total-return indices rebased to 100\nShading shows the most likely smoothed common HMM state",
+       x = NULL, y = "Total Return Index (Rebased to 100)", fill = "Estimated HMM Regime") +
+  theme_minimal(base_size = 11) +
+  theme(plot.title = element_text(face = "bold", size = 14), plot.subtitle = element_text(size = 10),
+        axis.text = element_text(size = 9), strip.text = element_text(size = 11, face = "bold"),
+        legend.position = "bottom", panel.spacing = grid::unit(.75, "lines"),
+        plot.margin = margin(10, 16, 10, 14))
+save_plot(p_historical_states, "Diagnostic_04_Historical_Assets_HMM_Regimes.png", width = 10, height = 7.2)
+```
+
+```{r simulation}
+# One-year Monte Carlo ---------------------------------------------------------
+
+sample_next_state <- function(state, P) {
+  out <- integer(length(state))
+  for (k in seq_len(nrow(P))) {
+    idx <- which(state == k)
+    if (length(idx)) out[idx] <- sample.int(nrow(P), length(idx), replace = TRUE, prob = P[k, ])
+  }
+  out
+}
+
+draw_hmm_rp <- function(states, mu, Sigma) {
+  out <- matrix(NA_real_, length(states), ncol(mu), dimnames = list(NULL, colnames(mu)))
+  for (k in seq_len(nrow(mu))) {
+    idx <- which(states == k)
+    if (length(idx)) out[idx, ] <- rmvnorm(length(idx), mu[k, ], Sigma[[k]])
+  }
+  out
+}
+
+simulate_benchmark_portfolio <- function(n_sims, mu, Sigma, rf, seed) {
+  set.seed(seed); value <- rep(initial_value, n_sims)
+  for (m in seq_len(projection_months))
+    value <- value * as.vector(exp(rmvnorm(n_sims, mu, Sigma) + rf[m]) %*% strategic_weights)
+  list(annual_value = value, annual_return = value / initial_value - 1)
+}
+
+simulate_hmm_portfolio <- function(n_sims, mu, Sigma, P, final, rf, seed) {
+  set.seed(seed); value <- rep(initial_value, n_sims)
+  first_prob <- as.vector(final %*% P); first_prob <- first_prob / sum(first_prob)
+  state <- sample.int(nrow(P), n_sims, replace = TRUE, prob = first_prob)
+  for (m in seq_len(projection_months)) {
+    if (m > 1) state <- sample_next_state(state, P)
+    value <- value * as.vector(exp(draw_hmm_rp(state, mu, Sigma) + rf[m]) %*% strategic_weights)
+  }
+  list(annual_value = value, annual_return = value / initial_value - 1,
+       first_month_probability = first_prob)
+}
+
+benchmark_sim <- simulate_benchmark_portfolio(n_simulations, benchmark_mu, benchmark_sigma,
+                                               projection_forward_log_returns, benchmark_seed)
+hmm_sim <- simulate_hmm_portfolio(n_simulations, mu_hmm, Sigma_hmm, P_row,
+                                  final_filtered_probabilities, projection_forward_log_returns, hmm_seed)
+simulation_outcomes <- bind_rows(
+  tibble(Model = "Benchmark", Portfolio_Return_1Y = benchmark_sim$annual_return),
+  tibble(Model = "HMM", Portfolio_Return_1Y = hmm_sim$annual_return)
+)
+
+projected_regime_probabilities <- matrix(NA_real_, projection_months, selected_hmm_states,
+                                         dimnames = list(NULL, state_labels))
+p_now <- final_filtered_probabilities
+for (m in seq_len(projection_months)) {
+  p_now <- as.vector(p_now %*% P_row)
+  projected_regime_probabilities[m, ] <- p_now
+}
+projected_regime_probability_table <- as.data.frame(projected_regime_probabilities) %>%
+  mutate(Month = seq_len(projection_months), .before = 1)
+kable(projected_regime_probability_table, digits = 4,
+      caption = "Projected HMM state probabilities over the one-year horizon")
+```
+
+```{r risk-and-validation}
+# REC, TVaR and shareholder return --------------------------------------------
+
+calculate_risk <- function(values, model) {
+  L1 <- initial_value * exp(risk_free_cc_rate)
+  shortfall <- L1 - values
+  q995 <- unname(quantile(shortfall, var_confidence, type = 8))
+  q99 <- unname(quantile(shortfall, tvar_confidence, type = 8))
+  rec1 <- max(0, q995); rec0 <- rec1 * exp(-risk_free_cc_rate)
+  tvar1 <- mean(shortfall[shortfall >= q99]); tvar0 <- tvar1 * exp(-risk_free_cc_rate)
+  full_pv <- exp(-risk_free_cc_rate) * rec0 * (exp(required_return_cc) - 1)
+  excess_pv <- rec0 * (exp(cost_of_capital_spread_cc) - 1)
+  tibble(Model = model, Liability_T0 = initial_value, Liability_T1 = L1,
+         Mean_Asset_T1 = mean(values), SD_Asset_T1 = sd(values),
+         VaR_99_5_Shortfall_T1 = q995, REC_T1 = rec1, REC_T0 = rec0,
+         VaR_99_Shortfall_T1 = q99, TVaR_99_Shortfall_T1 = tvar1, TVaR_99_PV_T0 = tvar0,
+         Risk_Free_CC = risk_free_cc_rate, Required_Return_CC = required_return_cc,
+         CoC_Spread_CC = cost_of_capital_spread_cc,
+         Full_Required_Return_PV_T0 = full_pv, Excess_CoC_PV_T0 = excess_pv)
+}
+
+risk_summary <- bind_rows(calculate_risk(benchmark_sim$annual_value, "Benchmark"),
+                          calculate_risk(hmm_sim$annual_value, "HMM"))
+economic_balance_sheet <- risk_summary %>% transmute(
+  Model, Liability_MV_T0 = Liability_T0, Supporting_Assets_T0 = initial_value,
+  Required_Economic_Capital_T0 = REC_T0,
+  Total_Assets_Including_REC_T0 = initial_value + REC_T0,
+  TVaR_99_PV_T0, Full_Required_Return_PV_T0, Excess_CoC_PV_T0
+)
+write_out(risk_summary, "risk_REC_TVaR_CoC_summary.csv")
+write_out(economic_balance_sheet, "economic_balance_sheet_comparison.csv")
+
+# Monthly risk-premium validation ---------------------------------------------
+
+simulate_hmm_monthly <- function(n_months, burnin, mu, Sigma, P, stationary, seed) {
+  set.seed(seed); n <- n_months + burnin; states <- integer(n)
+  states[1] <- sample.int(nrow(P), 1, prob = stationary)
+  for (i in 2:n) states[i] <- sample.int(nrow(P), 1, prob = P[states[i - 1], ])
+  RP <- draw_hmm_rp(states, mu, Sigma)
+  RP[(burnin + 1):n, , drop = FALSE]
+}
+set.seed(validation_seed)
+benchmark_validation_rp <- rmvnorm(validation_months, benchmark_mu, benchmark_sigma)
+colnames(benchmark_validation_rp) <- asset_names
+hmm_validation_rp <- simulate_hmm_monthly(validation_months, validation_burnin, mu_hmm, Sigma_hmm,
+                                           P_row, stationary_probabilities, validation_seed + 1L)
+validation_distribution <- bind_rows(
+  distribution_stats(risk_premium_matrix, "Historical"),
+  distribution_stats(benchmark_validation_rp, "Benchmark"),
+  distribution_stats(hmm_validation_rp, "HMM")
+)
+write_out(validation_distribution, "validation_risk_premium_distribution.csv")
+
+annual_summary <- function(x, model) tibble(
+  Model = model, Mean_Return = mean(x), SD_Return = sd(x),
+  Q005_Return = unname(quantile(x, .005, type = 8)),
+  Q01_Return = unname(quantile(x, .01, type = 8)),
+  Q05_Return = unname(quantile(x, .05, type = 8)), Median_Return = median(x)
+)
+annual_model_summary <- bind_rows(
+  annual_summary(historical_rolling_annual_return, "Historical rolling 12m"),
+  annual_summary(benchmark_sim$annual_return, "Benchmark"),
+  annual_summary(hmm_sim$annual_return, "HMM")
+)
+write_out(annual_model_summary, "annual_portfolio_model_comparison.csv")
+
+# Monte Carlo stability: ------------------------------------------------------
+
+batch_metrics <- function(values, model) {
+  batch <- cut(seq_along(values), 10, labels = FALSE); L1 <- initial_value * exp(risk_free_cc_rate)
+  bind_rows(lapply(1:10, function(b) {
+    s <- L1 - values[batch == b]
+    q995 <- quantile(s, var_confidence, type = 8); q99 <- quantile(s, tvar_confidence, type = 8)
+    tibble(Model = model, Batch = b, VaR = as.numeric(q995), TVaR = mean(s[s >= q99]))
+  }))
+}
+mc_stability_summary <- bind_rows(batch_metrics(benchmark_sim$annual_value, "Benchmark"),
+                                  batch_metrics(hmm_sim$annual_value, "HMM")) %>%
+  group_by(Model) %>% summarise(
+    Mean_VaR_99_5 = mean(VaR), SD_VaR_99_5 = sd(VaR), CV_VaR_99_5 = SD_VaR_99_5 / abs(Mean_VaR_99_5),
+    Mean_TVaR_99 = mean(TVaR), SD_TVaR_99 = sd(TVaR), CV_TVaR_99 = SD_TVaR_99 / abs(Mean_TVaR_99), .groups = "drop")
+write_out(mc_stability_summary, "monte_carlo_tail_stability_summary.csv")
+```
+
+```{r distribution-figures}
+# Distribution figures ---------------------------------------------------------
+
+p_distribution <- ggplot(simulation_outcomes, aes(Portfolio_Return_1Y, colour = Model)) +
+  geom_density(linewidth = 1) +
+  scale_colour_manual(values = c(Benchmark = "#111111", HMM = "#F28C28")) +
+  scale_x_continuous(labels = percent) +
+  labs(title = "One-Year Portfolio Return Distribution", x = "One-year portfolio return", y = "Density") +
+  theme_minimal()
+save_plot(p_distribution, "Diagnostic_05_Annual_Portfolio_Distribution.png")
+
+common_tail_cutoff <- min(quantile(benchmark_sim$annual_return, .10, type = 8),
+                          quantile(hmm_sim$annual_return, .10, type = 8))
+tail_plot_data <- simulation_outcomes %>% filter(Portfolio_Return_1Y <= common_tail_cutoff)
+p_tail <- ggplot(tail_plot_data, aes(Portfolio_Return_1Y, colour = Model, fill = Model)) +
+  geom_density(alpha = .18, linewidth = 1) +
+  scale_colour_manual(values = c(Benchmark = "#111111", HMM = "#F28C28")) +
+  scale_fill_manual(values = c(Benchmark = "#777777", HMM = "#F28C28")) +
+  scale_x_continuous(labels = percent_format(accuracy = .1)) +
+  labs(title = "Lower-Tail One-Year Portfolio Returns",
+       subtitle = "Common lower-tail region under the risk-premium ESG projection",
+       x = "One-year portfolio return", y = "Density") + theme_minimal()
+save_plot(p_tail, "Diagnostic_06_Lower_Tail_ESG_Comparison.png")
+```
+
+```{r calibration-window-sensitivity}
+# 20/25/30 year calibration-window sensitivity --------------------------------
+
+build_window <- function(n_years) {
+  start <- analysis_end_month %m-% lubridate::years(n_years)
+  prices <- monthly_assets_all %>% filter(month >= start, month <= analysis_end_month) %>% arrange(month)
+  prices <- prices %>% left_join(align_rba(prices), by = c("month", "calendar_month_end"))
+  X <- diff(log(as.matrix(prices[, asset_names]))); colnames(X) <- asset_names
+  rf <- vapply(seq_len(nrow(prices) - 1L), function(i)
+    integrate_forward(extract_forward_nodes(prices[i, , drop = FALSE]), 0, 1 / 12), numeric(1))
+  RP <- sweep(X, 1, rf, "-"); colnames(RP) <- asset_names
+  list(start = start, RP = RP)
+}
+
+fit_window_hmm <- function(RP) {
+  fit <- fit_hmm(selected_hmm_states, Y = RP * hmm_fit_scale)
+  c(extract_hmm(fit), list(fit = fit, converged = hmm_converged(fit)))
+}
+
+portfolio_state_table <- function(h, years) bind_rows(lapply(h$labels, function(s) {
+  k <- match(s, rownames(h$mu))
+  rp <- as.numeric(h$mu[k, ] %*% strategic_weights)
+  vol <- sqrt(as.numeric(t(strategic_weights) %*% h$Sigma[[k]] %*% strategic_weights))
+  tibble(Calibration_Years = years, State = s,
+         Portfolio_Risk_Premium_Annualised_CC = 12 * rp,
+         Portfolio_Volatility_Annualised = sqrt(12) * vol,
+         Smoothed_Occupancy = h$occupancy[s], Stationary_Probability = h$stationary[s],
+         Expected_Duration_Months = h$duration[s])
+}))
+
+sens_capital <- list(); sens_states <- list()
+for (yrs in c(20L, 25L, 30L)) {
+  w <- build_window(yrs)
+  bmu <- colMeans(w$RP); bsig <- cov(w$RP)
+  h <- fit_window_hmm(w$RP)
+  bsim <- simulate_benchmark_portfolio(n_simulations, bmu, bsig, projection_forward_log_returns, benchmark_seed)
+  hsim <- simulate_hmm_portfolio(n_simulations, h$mu, h$Sigma, h$P, h$final,
+                                 projection_forward_log_returns, hmm_seed)
+  br <- calculate_risk(bsim$annual_value, "Benchmark")
+  hr <- calculate_risk(hsim$annual_value, "HMM")
+  sens_capital[[as.character(yrs)]] <- tibble(
+    Calibration_Years = yrs, Start_Month = as.character(w$start), End_Month = as.character(analysis_end_month),
+    Monthly_Returns = nrow(w$RP), HMM_Converged = h$converged, Minimum_HMM_Occupancy = min(h$occupancy),
+    Benchmark_Mean_Asset_T1 = br$Mean_Asset_T1, Benchmark_SD_Asset_T1 = br$SD_Asset_T1,
+    Benchmark_REC_T0 = br$REC_T0, Benchmark_TVaR99_PV_T0 = br$TVaR_99_PV_T0,
+    HMM_Mean_Asset_T1 = hr$Mean_Asset_T1, HMM_SD_Asset_T1 = hr$SD_Asset_T1,
+    HMM_REC_T0 = hr$REC_T0, HMM_TVaR99_PV_T0 = hr$TVaR_99_PV_T0,
+    HMM_REC_Uplift_vs_Benchmark = hr$REC_T0 / br$REC_T0 - 1
+  )
+  sens_states[[as.character(yrs)]] <- portfolio_state_table(h, yrs)
+}
+
+calibration_window_sensitivity <- bind_rows(sens_capital) %>% arrange(Calibration_Years)
+base_rec <- calibration_window_sensitivity$HMM_REC_T0[calibration_window_sensitivity$Calibration_Years == 20]
+calibration_window_sensitivity <- calibration_window_sensitivity %>%
+  mutate(HMM_REC_Percent_Change_vs_20Y = HMM_REC_T0 / base_rec - 1)
+calibration_window_state_sensitivity <- bind_rows(sens_states) %>%
+  mutate(State = factor(State, levels = c("Normal", "Growth", "Stress"))) %>% arrange(Calibration_Years, State)
+write_out(calibration_window_sensitivity, "sensitivity_calibration_window_capital.csv")
+write_out(calibration_window_state_sensitivity, "sensitivity_calibration_window_states.csv")
+
+```
+
+```{r key-results}
+# Results ---------------------------------------------------------------------
+kable(model_selection_table, digits = 4, caption = "Benchmark and HMM state-count diagnostics")
+kable(transition_table, digits = 4, caption = "Selected HMM transition probabilities")
+kable(regime_parameter_table, digits = 4, caption = "Selected HMM regime parameters")
+kable(risk_summary, digits = 4, caption = "REC, TVaR and shareholder-return measures")
+kable(annual_model_summary, digits = 4, caption = "One-year portfolio comparison")
+kable(calibration_window_sensitivity, digits = 4, caption = "Calibration-window sensitivity")
+```

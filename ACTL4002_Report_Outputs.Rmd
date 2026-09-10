@@ -1,0 +1,879 @@
+```{r setup, message=FALSE, warning=FALSE}
+# =============================================================================
+# FINAL REPORT OUTPUT SETUP
+# =============================================================================
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(gt)
+
+# File locations
+
+data_dir <- "/Users/katz/Desktop/UNi Year 4/Semester 2/ALM/"
+
+output_dir <- file.path(data_dir, "ACTL4002_ESG_outputs")
+report_dir <- file.path(output_dir, "report")
+
+if (!dir.exists(output_dir)) {
+  stop(
+    "ACTL4002_ESG_outputs was not found. Run ACTL4002_ESG_FINAL.Rmd first."
+  )
+}
+
+dir.create(report_dir, showWarnings = FALSE, recursive = TRUE)
+
+stale_report_outputs <- list.files(
+  report_dir,
+  pattern = "^(Table_|Figure_).*(\\.png|\\.svg)$",
+  full.names = TRUE
+)
+
+if (length(stale_report_outputs) > 0) {
+  unlink(stale_report_outputs, force = TRUE)
+}
+
+# Final report dimensions and palette
+
+WORD_BODY_WIDTH_IN <- 6.27
+CSS_PX_PER_IN <- 96
+GT_VIEWPORT_WIDTH <- round(WORD_BODY_WIDTH_IN * CSS_PX_PER_IN)
+GT_SCREENSHOT_ZOOM <- 3
+PT_TO_CSS_PX <- 96 / 72
+
+pt_css <- function(x) gt::px(x * PT_TO_CSS_PX)
+
+pal <- list(
+  orange = "#F28C28",
+  orange_dark = "#D97706",
+  black = "#111111",
+  grey_dark = "#4B4B4B",
+  grey = "#7A7A7A",
+  grey_light = "#D9D9D9",
+  grey_pale = "#F2F2F2",
+  white = "#FFFFFF"
+)
+
+read_output <- function(stem) {
+  path <- file.path(output_dir, paste0(stem, ".csv"))
+  if (!file.exists(path)) {
+    stop("Required pipeline output not found: ", basename(path))
+  }
+  readr::read_csv(path, show_col_types = FALSE)
+}
+
+style_report_gt <- function(gt_obj, first_column_left = TRUE) {
+  out <- gt_obj %>%
+    tab_options(
+      table.width = pct(100),
+      table.background.color = pal$white,
+      table.border.top.color = pal$orange,
+      table.border.top.width = px(4),
+      table.border.bottom.color = pal$orange,
+      table.border.bottom.width = px(2),
+      table.font.size = pt_css(10),
+      table.font.names = c("Arial", "Helvetica", "sans-serif"),
+      heading.background.color = pal$black,
+      heading.title.font.size = pt_css(12.5),
+      heading.subtitle.font.size = pt_css(9.5),
+      heading.title.font.weight = "bold",
+      heading.align = "left",
+      heading.padding = px(9),
+      column_labels.background.color = pal$orange,
+      column_labels.font.weight = "bold",
+      column_labels.font.size = pt_css(10),
+      column_labels.padding = px(8),
+      row.striping.background_color = pal$grey_pale,
+      data_row.padding = px(7)
+    ) %>%
+    opt_row_striping() %>%
+    cols_align(align = "center") %>%
+    tab_style(
+      style = cell_text(color = pal$white, weight = "bold"),
+      locations = cells_title(groups = "title")
+    ) %>%
+    tab_style(
+      style = cell_text(color = pal$grey_light),
+      locations = cells_title(groups = "subtitle")
+    ) %>%
+    tab_style(
+      style = cell_text(color = pal$black, weight = "bold"),
+      locations = cells_column_labels(everything())
+    )
+
+  if (first_column_left) {
+    first_col <- names(gt_obj[["_data"]])[1]
+    out <- out %>%
+      cols_align(align = "left", columns = all_of(first_col))
+  }
+
+  out
+}
+
+export_table <- function(gt_obj, number, stem) {
+  filename <- sprintf("Table_%02d_%s.png", number, stem)
+
+  gt::gtsave(
+    gt_obj,
+    file.path(report_dir, filename),
+    vwidth = GT_VIEWPORT_WIDTH,
+    zoom = GT_SCREENSHOT_ZOOM,
+    expand = 5
+  )
+
+  invisible(gt_obj)
+}
+
+theme_report <- function() {
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(
+        face = "bold", size = 13, colour = pal$black,
+        margin = margin(b = 4)
+      ),
+      plot.subtitle = element_text(
+        size = 10.5, colour = pal$grey_dark,
+        margin = margin(b = 7)
+      ),
+      plot.caption = element_text(size = 9, colour = pal$grey),
+      axis.title = element_text(size = 10.5, face = "bold", colour = pal$black),
+      axis.text = element_text(size = 10, colour = pal$grey_dark),
+      legend.title = element_text(size = 10, face = "bold", colour = pal$black),
+      legend.text = element_text(size = 10, colour = pal$grey_dark),
+      panel.grid.major = element_line(colour = pal$grey_light, linewidth = 0.3),
+      panel.grid.minor = element_blank(),
+      legend.position = "bottom",
+      plot.background = element_rect(fill = pal$white, colour = NA),
+      plot.margin = margin(7, 7, 7, 7)
+    )
+}
+
+export_figure <- function(plot_obj, number, stem, aspect_ratio = 1.80) {
+  filename <- sprintf("Figure_%02d_%s.png", number, stem)
+  width_in <- WORD_BODY_WIDTH_IN
+  height_in <- width_in / aspect_ratio
+
+  ggsave(
+    filename = file.path(report_dir, filename),
+    plot = plot_obj + theme_report(),
+    width = width_in,
+    height = height_in,
+    units = "in",
+    dpi = 320,
+    bg = "white"
+  )
+
+  invisible(plot_obj)
+}
+```
+
+```{r read-retained-outputs}
+historical_rp <- read_output("validation_risk_premium_distribution")
+benchmark_params <- read_output("benchmark_risk_premium_parameters")
+benchmark_corr <- read_output("benchmark_risk_premium_correlation_matrix")
+model_sel <- read_output("model_selection_diagnostics")
+regime_params <- read_output("hmm_regime_parameters")
+regime_corr <- read_output("hmm_regime_correlations")
+risk <- read_output("risk_REC_TVaR_CoC_summary")
+ebs <- read_output("economic_balance_sheet_comparison")
+annual_comparison <- read_output("annual_portfolio_model_comparison")
+calibration_sensitivity <- read_output("sensitivity_calibration_window_capital")
+
+weights <- c(
+  Equities = 0.50,
+  Property = 0.10,
+  Bonds = 0.40
+)
+
+state_order <- c("Normal", "Growth", "Stress")
+asset_order <- c("Equities", "Property", "Bonds")
+```
+
+```{r derive-regime-summary}
+portfolio_vol_by_state <- bind_rows(
+  lapply(
+    state_order,
+    function(s) {
+      vols <- regime_params %>%
+        filter(State == s) %>%
+        mutate(Asset = factor(Asset, levels = asset_order)) %>%
+        arrange(Asset) %>%
+        pull(Vol_annualised)
+
+      corr_s <- regime_corr %>%
+        filter(State == s) %>%
+        mutate(
+          Asset_1 = factor(Asset_1, levels = asset_order),
+          Asset_2 = factor(Asset_2, levels = asset_order)
+        ) %>%
+        arrange(Asset_1, Asset_2) %>%
+        select(Asset_1, Asset_2, Correlation) %>%
+        pivot_wider(names_from = Asset_2, values_from = Correlation) %>%
+        arrange(Asset_1)
+
+      corr_matrix <- as.matrix(corr_s[, asset_order])
+      sigma_matrix <- diag(vols) %*% corr_matrix %*% diag(vols)
+
+      tibble::tibble(
+        State = s,
+        Portfolio_Volatility = sqrt(
+          as.numeric(t(weights) %*% sigma_matrix %*% weights)
+        )
+      )
+    }
+  )
+)
+
+regime_summary <- regime_params %>%
+  mutate(
+    Weight = weights[Asset],
+    Weighted_RP = Mean_annualised_risk_premium_cc * Weight,
+    Weighted_Total = Mean_annualised_cc * Weight
+  ) %>%
+  group_by(State) %>%
+  summarise(
+    Portfolio_RP = sum(Weighted_RP),
+    Implied_Total_Return = sum(Weighted_Total),
+    Historical_Occupancy = first(Smoothed_Occupancy),
+    Expected_Duration_Months = first(Expected_Duration_Months),
+    .groups = "drop"
+  ) %>%
+  left_join(portfolio_vol_by_state, by = "State") %>%
+  mutate(State = factor(State, levels = state_order)) %>%
+  arrange(State)
+```
+
+```{r table-01}
+table_01 <- tibble::tibble(
+  `Asset class` = c(
+    "Australian equities",
+    "Australian property",
+    "Australian bonds"
+  ),
+  `Selected market proxy` = c(
+    "S&P/ASX 200 (AXJO)",
+    "S&P/ASX 200 A-REIT (AXPJA)",
+    "Bloomberg AusBond Composite 0+ Year Index (BACM0)"
+  )
+)
+
+gt_01 <- table_01 %>%
+  gt() %>%
+  tab_header(
+    title = md("**Australian Asset-Class Market Proxies**"),
+    subtitle = "Historical market series used for ESG calibration"
+  ) %>%
+  cols_width(
+    `Asset class` ~ pct(35),
+    `Selected market proxy` ~ pct(65)
+  ) %>%
+  cols_align(align = "left", columns = everything()) %>%
+  style_report_gt()
+
+export_table(gt_01, 1, "Asset_Market_Proxies")
+gt_01
+```
+
+```{r table-02}
+table_02 <- historical_rp %>%
+  filter(Source == "Historical") %>%
+  transmute(
+    Asset,
+    `Mean RP p.a.` = Mean_annualised_cc,
+    `Volatility p.a.` = Vol_annualised,
+    Skewness,
+    `Excess kurtosis` = Excess_Kurtosis,
+    `Historical 1% monthly RP` = Q01
+  )
+
+gt_02 <- table_02 %>%
+  gt() %>%
+  tab_header(
+    title = md("**Historical Risk-Premium Characteristics**"),
+    subtitle = "Twenty-year monthly calibration sample"
+  ) %>%
+  fmt_percent(
+    columns = c(`Mean RP p.a.`, `Volatility p.a.`, `Historical 1% monthly RP`),
+    decimals = 2
+  ) %>%
+  fmt_number(columns = c(Skewness, `Excess kurtosis`), decimals = 2) %>%
+  cols_width(
+    Asset ~ pct(16),
+    `Mean RP p.a.` ~ pct(15),
+    `Volatility p.a.` ~ pct(15),
+    Skewness ~ pct(13),
+    `Excess kurtosis` ~ pct(17),
+    `Historical 1% monthly RP` ~ pct(24)
+  ) %>%
+  style_report_gt()
+
+export_table(gt_02, 2, "Historical_Risk_Premium_Characteristics")
+gt_02
+```
+
+```{r table-03}
+table_03 <- benchmark_params %>%
+  transmute(
+    Asset,
+    `Mean RP p.a.` = Mean_annualised_risk_premium_cc,
+    `Implied total return p.a.` = Implied_mean_annualised_total_return_cc,
+    `Volatility p.a.` = Vol_annualised
+  )
+
+gt_03 <- table_03 %>%
+  gt() %>%
+  tab_header(
+    title = md("**Benchmark Multivariate Lognormal Parameters**"),
+    subtitle = "Annualised continuously compounded parameters"
+  ) %>%
+  fmt_percent(
+    columns = c(`Mean RP p.a.`, `Implied total return p.a.`, `Volatility p.a.`),
+    decimals = 2
+  ) %>%
+  cols_width(
+    Asset ~ pct(24),
+    `Mean RP p.a.` ~ pct(23),
+    `Implied total return p.a.` ~ pct(30),
+    `Volatility p.a.` ~ pct(23)
+  ) %>%
+  style_report_gt()
+
+export_table(gt_03, 3, "Benchmark_Parameters")
+gt_03
+```
+
+```{r table-04}
+table_04 <- model_sel %>%
+  transmute(
+    Model,
+    `k` = States,
+    LogLik = Log_Likelihood,
+    AIC,
+    BIC,
+    `Conv.` = Converged,
+    `Iter.` = Iterations,
+    `Min. occupancy` = Minimum_Smoothed_Occupancy
+  )
+
+gt_04 <- table_04 %>%
+  gt() %>%
+  tab_header(
+    title = md("**HMM State-Count Model Selection**"),
+    subtitle = "Fit, convergence and state-occupancy diagnostics"
+  ) %>%
+  fmt_number(columns = c(LogLik, AIC, BIC), decimals = 2) %>%
+  fmt_percent(columns = `Min. occupancy`, decimals = 1) %>%
+  cols_width(
+    Model ~ pct(24),
+    `k` ~ pct(6),
+    LogLik ~ pct(14),
+    AIC ~ pct(12),
+    BIC ~ pct(12),
+    `Conv.` ~ pct(10),
+    `Iter.` ~ pct(9),
+    `Min. occupancy` ~ pct(13)
+  ) %>%
+  style_report_gt() %>%
+  tab_style(
+    style = list(cell_fill(color = "#E6E6E6"), cell_text(weight = "bold")),
+    locations = cells_body(rows = Model == "HMM 3-state")
+  )
+
+export_table(gt_04, 4, "HMM_State_Count_Selection")
+gt_04
+```
+
+```{r table-05}
+table_05 <- regime_summary %>%
+  transmute(
+    State = as.character(State),
+    `Portfolio RP` = Portfolio_RP,
+    `Total return` = Implied_Total_Return,
+    Volatility = Portfolio_Volatility,
+    Occupancy = Historical_Occupancy,
+    `Duration (m)` = Expected_Duration_Months
+  )
+
+gt_05 <- table_05 %>%
+  gt() %>%
+  tab_header(
+    title = md("**3-State HMM Portfolio Regime Summary**"),
+    subtitle = "Portfolio risk premium, volatility, occupancy and persistence"
+  ) %>%
+  fmt_percent(
+    columns = c(`Portfolio RP`, `Total return`, Volatility, Occupancy),
+    decimals = 2
+  ) %>%
+  fmt_number(columns = `Duration (m)`, decimals = 1) %>%
+  cols_width(
+    State ~ pct(16),
+    `Portfolio RP` ~ pct(17),
+    `Total return` ~ pct(18),
+    Volatility ~ pct(17),
+    Occupancy ~ pct(16),
+    `Duration (m)` ~ pct(16)
+  ) %>%
+  style_report_gt()
+
+export_table(gt_05, 5, "HMM_Portfolio_Regime_Summary")
+gt_05
+```
+
+```{r table-06}
+get_corr <- function(state, a1, a2) {
+  regime_corr %>%
+    filter(State == state, Asset_1 == a1, Asset_2 == a2) %>%
+    pull(Correlation) %>%
+    first()
+}
+
+table_06 <- tibble::tibble(
+  Correlation = c("Equity–Property", "Equity–Bonds", "Property–Bonds"),
+  Normal = c(
+    get_corr("Normal", "Equities", "Property"),
+    get_corr("Normal", "Equities", "Bonds"),
+    get_corr("Normal", "Property", "Bonds")
+  ),
+  Growth = c(
+    get_corr("Growth", "Equities", "Property"),
+    get_corr("Growth", "Equities", "Bonds"),
+    get_corr("Growth", "Property", "Bonds")
+  ),
+  Stress = c(
+    get_corr("Stress", "Equities", "Property"),
+    get_corr("Stress", "Equities", "Bonds"),
+    get_corr("Stress", "Property", "Bonds")
+  )
+)
+
+gt_06 <- table_06 %>%
+  gt() %>%
+  tab_header(
+    title = md("**HMM State-Dependent Correlations**"),
+    subtitle = "Cross-asset dependence varies with the common hidden market state"
+  ) %>%
+  fmt_number(columns = c(Normal, Growth, Stress), decimals = 2) %>%
+  cols_width(
+    Correlation ~ pct(40),
+    Normal ~ pct(20),
+    Growth ~ pct(20),
+    Stress ~ pct(20)
+  ) %>%
+  style_report_gt()
+
+export_table(gt_06, 6, "HMM_State_Dependent_Correlations")
+gt_06
+```
+
+```{r table-07}
+model_order <- c("Historical rolling 12m", "Benchmark", "HMM")
+
+annual_wide <- annual_comparison %>%
+  mutate(Model = factor(Model, levels = model_order)) %>%
+  arrange(Model)
+
+value_for <- function(model, column) {
+  annual_wide[as.character(annual_wide$Model) == model, column, drop = TRUE][1]
+}
+
+table_07 <- tibble::tibble(
+  Measure = c(
+    "Mean return",
+    "Standard deviation",
+    "5% quantile",
+    "1% quantile",
+    "0.5% quantile"
+  ),
+  `Historical rolling 12m` = c(
+    value_for("Historical rolling 12m", "Mean_Return"),
+    value_for("Historical rolling 12m", "SD_Return"),
+    value_for("Historical rolling 12m", "Q05_Return"),
+    value_for("Historical rolling 12m", "Q01_Return"),
+    value_for("Historical rolling 12m", "Q005_Return")
+  ),
+  Benchmark = c(
+    value_for("Benchmark", "Mean_Return"),
+    value_for("Benchmark", "SD_Return"),
+    value_for("Benchmark", "Q05_Return"),
+    value_for("Benchmark", "Q01_Return"),
+    value_for("Benchmark", "Q005_Return")
+  ),
+  HMM = c(
+    value_for("HMM", "Mean_Return"),
+    value_for("HMM", "SD_Return"),
+    value_for("HMM", "Q05_Return"),
+    value_for("HMM", "Q01_Return"),
+    value_for("HMM", "Q005_Return")
+  )
+)
+
+gt_07 <- table_07 %>%
+  gt() %>%
+  tab_header(
+    title = md("**One-Year Portfolio Validation**"),
+    subtitle = "Historical rolling outcomes compared with Benchmark and HMM simulations"
+  ) %>%
+  fmt_percent(columns = c(`Historical rolling 12m`, Benchmark, HMM), decimals = 2) %>%
+  cols_width(
+    Measure ~ pct(34),
+    `Historical rolling 12m` ~ pct(26),
+    Benchmark ~ pct(20),
+    HMM ~ pct(20)
+  ) %>%
+  style_report_gt()
+
+export_table(gt_07, 7, "One_Year_Portfolio_Validation")
+gt_07
+```
+
+```{r table-08}
+benchmark_ebs <- ebs %>% filter(Model == "Benchmark")
+hmm_ebs <- ebs %>% filter(Model == "HMM")
+
+b <- function(col) benchmark_ebs[[col]][1]
+h <- function(col) hmm_ebs[[col]][1]
+
+table_08 <- tibble::tibble(
+  Component = c(
+    "Market-consistent liability",
+    "Supporting assets",
+    "Required Economic Capital",
+    "Total assets including REC",
+    "99% TVaR PV",
+    "Excess 6% CoC PV",
+    "Full required-return PV"
+  ),
+  Benchmark = c(
+    b("Liability_MV_T0"),
+    b("Supporting_Assets_T0"),
+    b("Required_Economic_Capital_T0"),
+    b("Total_Assets_Including_REC_T0"),
+    b("TVaR_99_PV_T0"),
+    b("Excess_CoC_PV_T0"),
+    b("Full_Required_Return_PV_T0")
+  ),
+  HMM = c(
+    h("Liability_MV_T0"),
+    h("Supporting_Assets_T0"),
+    h("Required_Economic_Capital_T0"),
+    h("Total_Assets_Including_REC_T0"),
+    h("TVaR_99_PV_T0"),
+    h("Excess_CoC_PV_T0"),
+    h("Full_Required_Return_PV_T0")
+  )
+) %>%
+  mutate(
+    `HMM vs Benchmark` = ifelse(
+      Component %in% c(
+        "Required Economic Capital",
+        "99% TVaR PV",
+        "Excess 6% CoC PV",
+        "Full required-return PV"
+      ),
+      HMM / Benchmark - 1,
+      NA_real_
+    )
+  )
+
+gt_08 <- table_08 %>%
+  gt() %>%
+  tab_header(
+    title = md("**Economic Balance Sheet Comparison**"),
+    subtitle = "AUD per AUD100 initial supporting assets"
+  ) %>%
+  fmt_number(columns = c(Benchmark, HMM), decimals = 2) %>%
+  fmt_percent(columns = `HMM vs Benchmark`, decimals = 1) %>%
+  sub_missing(columns = `HMM vs Benchmark`, missing_text = "—") %>%
+  cols_width(
+    Component ~ pct(43),
+    Benchmark ~ pct(18),
+    HMM ~ pct(18),
+    `HMM vs Benchmark` ~ pct(21)
+  ) %>%
+  style_report_gt() %>%
+  tab_style(
+    style = cell_text(weight = "bold"),
+    locations = cells_body(
+      rows = Component %in% c("Required Economic Capital", "99% TVaR PV")
+    )
+  )
+
+export_table(gt_08, 8, "Economic_Balance_Sheet")
+gt_08
+```
+
+```{r table-09}
+benchmark_risk <- risk %>% filter(Model == "Benchmark")
+hmm_risk <- risk %>% filter(Model == "HMM")
+
+rf_cc <- benchmark_risk$Risk_Free_CC[1]
+liability_t1 <- benchmark_risk$Liability_T1[1]
+df_1y <- exp(-rf_cc)
+
+benchmark_pv_excess <-
+  (benchmark_risk$Mean_Asset_T1[1] - liability_t1) * df_1y
+
+hmm_pv_excess <-
+  (hmm_risk$Mean_Asset_T1[1] - liability_t1) * df_1y
+
+table_09 <- tibble::tibble(
+  Measure = c(
+    "Expected year-end assets",
+    "Expected PV excess over liability",
+    "Required Economic Capital",
+    "Excess CoC PV",
+    "Expected PV benefit after excess CoC",
+    "Expected PV benefit after full required return"
+  ),
+  `Matching risk-free` = c(
+    liability_t1,
+    0,
+    0,
+    0,
+    0,
+    0
+  ),
+  `Benchmark risky` = c(
+    benchmark_risk$Mean_Asset_T1[1],
+    benchmark_pv_excess,
+    benchmark_risk$REC_T0[1],
+    benchmark_risk$Excess_CoC_PV_T0[1],
+    benchmark_pv_excess - benchmark_risk$Excess_CoC_PV_T0[1],
+    benchmark_pv_excess - benchmark_risk$Full_Required_Return_PV_T0[1]
+  ),
+  `HMM risky` = c(
+    hmm_risk$Mean_Asset_T1[1],
+    hmm_pv_excess,
+    hmm_risk$REC_T0[1],
+    hmm_risk$Excess_CoC_PV_T0[1],
+    hmm_pv_excess - hmm_risk$Excess_CoC_PV_T0[1],
+    hmm_pv_excess - hmm_risk$Full_Required_Return_PV_T0[1]
+  )
+)
+
+gt_09 <- table_09 %>%
+  gt() %>%
+  tab_header(
+    title = md("**TargetLife Investment Strategy Comparison**"),
+    subtitle = "Matching risk-free assets compared with the proposed 50/10/40 portfolio"
+  ) %>%
+  fmt_number(
+    columns = c(`Matching risk-free`, `Benchmark risky`, `HMM risky`),
+    decimals = 2
+  ) %>%
+  cols_width(
+    Measure ~ pct(46),
+    `Matching risk-free` ~ pct(18),
+    `Benchmark risky` ~ pct(18),
+    `HMM risky` ~ pct(18)
+  ) %>%
+  style_report_gt() %>%
+  tab_style(
+    style = list(cell_fill(color = pal$grey_light), cell_text(weight = "bold")),
+    locations = cells_body(rows = Measure == "Expected PV benefit after full required return")
+  )
+
+export_table(gt_09, 9, "Investment_Strategy_Comparison")
+gt_09
+```
+
+```{r table-10}
+table_10 <- calibration_sensitivity %>%
+  filter(Calibration_Years %in% c(20, 25, 30)) %>%
+  arrange(Calibration_Years) %>%
+  transmute(
+    `Calibration window` = paste0(Calibration_Years, " years"),
+    `HMM REC` = HMM_REC_T0,
+    `HMM vs Benchmark REC` = HMM_REC_Uplift_vs_Benchmark,
+    Interpretation = case_when(
+      Calibration_Years == 20 ~ "Base; economically coherent 3-state fit",
+      Calibration_Years == 25 ~ "Capital conclusion and Stress state remain stable",
+      Calibration_Years == 30 ~ "Near-absorbing Normal state; rejected as economically implausible",
+      TRUE ~ ""
+    )
+  )
+
+gt_10 <- table_10 %>%
+  gt() %>%
+  tab_header(
+    title = md("**Historical Calibration-Window Sensitivity**"),
+    subtitle = "All other projection and simulation assumptions held constant"
+  ) %>%
+  fmt_number(columns = `HMM REC`, decimals = 2) %>%
+  fmt_percent(columns = `HMM vs Benchmark REC`, decimals = 1) %>%
+  cols_width(
+    `Calibration window` ~ pct(18),
+    `HMM REC` ~ pct(15),
+    `HMM vs Benchmark REC` ~ pct(20),
+    Interpretation ~ pct(47)
+  ) %>%
+  style_report_gt() %>%
+  cols_align(align = "left", columns = Interpretation)
+
+export_table(gt_10, 10, "Calibration_Window_Sensitivity")
+gt_10
+```
+
+```{r figure-01}
+capital_plot_data <- risk %>%
+  select(Model, REC_T0, TVaR_99_PV_T0, Full_Required_Return_PV_T0) %>%
+  pivot_longer(
+    cols = -Model,
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Metric = recode(
+      Metric,
+      REC_T0 = "Required Economic Capital",
+      TVaR_99_PV_T0 = "TVaR 99%",
+      Full_Required_Return_PV_T0 = "Full required return"
+    )
+  )
+
+fig_01 <- ggplot(
+  capital_plot_data,
+  aes(x = Metric, y = Value, fill = Model)
+) +
+  geom_col(position = position_dodge(width = 0.74), width = 0.64) +
+  geom_text(
+    aes(label = sprintf("%.2f", Value)),
+    position = position_dodge(width = 0.74),
+    vjust = -0.35,
+    size = 3.6
+  ) +
+  scale_fill_manual(values = c(Benchmark = pal$black, HMM = pal$orange)) +
+  expand_limits(y = max(capital_plot_data$Value) * 1.12) +
+  labs(
+    title = "Economic Impact of the HMM",
+    subtitle = "Regime-dependent tail behaviour materially increases capital requirements",
+    x = NULL,
+    y = "AUD per AUD100 initial supporting assets",
+    fill = NULL
+  )
+
+export_figure(fig_01, 1, "Capital_Comparison", aspect_ratio = 1.85)
+fig_01 + theme_report()
+```
+
+```{r figure-02}
+annual_tail_data <- annual_comparison %>%
+  select(Model, Q005_Return, Q01_Return, Q05_Return) %>%
+  pivot_longer(
+    cols = c(Q005_Return, Q01_Return, Q05_Return),
+    names_to = "Quantile",
+    values_to = "Return"
+  ) %>%
+  mutate(
+    Quantile = factor(
+      Quantile,
+      levels = c("Q005_Return", "Q01_Return", "Q05_Return"),
+      labels = c("0.5%", "1%", "5%")
+    ),
+    Model = factor(Model, levels = c("Historical rolling 12m", "Benchmark", "HMM"))
+  )
+
+fig_02 <- ggplot(
+  annual_tail_data,
+  aes(x = Quantile, y = Return, colour = Model, group = Model)
+) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3) +
+  scale_colour_manual(
+    values = c(
+      "Historical rolling 12m" = pal$grey_dark,
+      "Benchmark" = pal$black,
+      "HMM" = pal$orange
+    )
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "One-Year Portfolio Downside Quantiles",
+    subtitle = "Historical rolling outcomes compared with Benchmark and HMM simulations",
+    x = "Lower-tail probability",
+    y = "One-year portfolio return",
+    colour = NULL
+  )
+
+export_figure(fig_02, 2, "Lower_Tail_Quantiles", aspect_ratio = 1.80)
+fig_02 + theme_report()
+```
+
+```{r figure-03}
+calibration_plot_data <- calibration_sensitivity %>%
+  select(Calibration_Years, Benchmark_REC_T0, HMM_REC_T0) %>%
+  pivot_longer(
+    cols = c(Benchmark_REC_T0, HMM_REC_T0),
+    names_to = "Model",
+    values_to = "REC_T0"
+  ) %>%
+  mutate(
+    Model = recode(
+      Model,
+      Benchmark_REC_T0 = "Benchmark",
+      HMM_REC_T0 = "HMM"
+    )
+  )
+
+fig_03 <- ggplot(
+  calibration_plot_data,
+  aes(x = Calibration_Years, y = REC_T0, colour = Model, group = Model)
+) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 3) +
+  scale_colour_manual(values = c(Benchmark = pal$black, HMM = pal$orange)) +
+  scale_x_continuous(breaks = c(20, 25, 30)) +
+  labs(
+    title = "Calibration-Window Sensitivity of Required Economic Capital",
+    subtitle = "All other projection and simulation assumptions held constant",
+    x = "Historical calibration window (years)",
+    y = "Required Economic Capital at T0",
+    colour = NULL
+  )
+
+export_figure(fig_03, 3, "Calibration_Window_REC", aspect_ratio = 1.80)
+fig_03 + theme_report()
+```
+
+```{r final-output-check}
+expected_report_files <- c(
+  sprintf("Table_%02d_%s.png", 1:10, c(
+    "Asset_Market_Proxies",
+    "Historical_Risk_Premium_Characteristics",
+    "Benchmark_Parameters",
+    "HMM_State_Count_Selection",
+    "HMM_Portfolio_Regime_Summary",
+    "HMM_State_Dependent_Correlations",
+    "One_Year_Portfolio_Validation",
+    "Economic_Balance_Sheet",
+    "Investment_Strategy_Comparison",
+    "Calibration_Window_Sensitivity"
+  )),
+  sprintf("Figure_%02d_%s.png", 1:3, c(
+    "Capital_Comparison",
+    "Lower_Tail_Quantiles",
+    "Calibration_Window_REC"
+  ))
+)
+
+report_check <- tibble::tibble(
+  File = expected_report_files,
+  Exists = file.exists(file.path(report_dir, expected_report_files))
+)
+
+if (!all(report_check$Exists)) {
+  warning(
+    "Some final report files were not created:\n",
+    paste(report_check$File[!report_check$Exists], collapse = "\n")
+  )
+}
+
+knitr::kable(
+  report_check,
+  caption = "Final report files — one version of each"
+)
+
+message("Final report outputs saved in: ", report_dir)
+```
